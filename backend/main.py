@@ -1,12 +1,19 @@
+import asyncio
+import base64
+import hashlib
+import hmac
 import json
+import math
 import os
 import secrets
 import string
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+import jwt
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -44,6 +51,40 @@ class ConvoyMember(Base):
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    phone_number: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    car_name: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    car_number: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+
+
+class RegisterInput(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=8, max_length=128)
+    name: str = Field(min_length=1, max_length=120)
+    phone_number: str = Field(min_length=1, max_length=40)
+    car_name: str = Field(min_length=1, max_length=120)
+    car_number: str = Field(min_length=1, max_length=40)
+
+
+class LoginInput(BaseModel):
+    email: str
+    password: str
+
+
+class ProfileUpdateInput(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    name: str = Field(min_length=1, max_length=120)
+    phone_number: str = Field(default="", max_length=40)
+    car_name: str = Field(min_length=1, max_length=120)
+    car_number: str = Field(min_length=1, max_length=40)
+
+
 class MemberInput(BaseModel):
     member_id: str = Field(min_length=1, max_length=255)
     name: str = Field(min_length=1, max_length=120)
@@ -52,7 +93,7 @@ class MemberInput(BaseModel):
 
 
 class CreateConvoyInput(MemberInput):
-    name: str = Field(min_length=1, max_length=120)
+    pass
 
 
 class StartInput(BaseModel):
@@ -72,10 +113,12 @@ class UpdateConvoyInput(BaseModel):
 class ConnectionManager:
     def __init__(self):
         self.rooms: dict[str, dict[str, WebSocket]] = {}
+        self.locations: dict[str, dict[str, dict]] = {}
 
     async def connect(self, code: str, member_id: str, websocket: WebSocket):
         await websocket.accept()
         self.rooms.setdefault(code, {})[member_id] = websocket
+        await websocket.send_text(json.dumps({"type": "location_snapshot", "locations": self.locations.get(code, {})}))
         await self.broadcast_presence(code)
 
     def disconnect(self, code: str, member_id: str):
@@ -110,10 +153,61 @@ class ConnectionManager:
         await self.broadcast(code, {"type": "member_kicked", "member_id": member_id})
 
     async def broadcast_member_left(self, code: str, member_id: str):
+        self.locations.get(code, {}).pop(member_id, None)
         await self.broadcast(code, {"type": "member_left", "member_id": member_id})
+
+    async def broadcast_trip_started(self, code: str):
+        await self.broadcast(code, {"type": "trip_started"})
+
+    async def broadcast_trip_ended(self, code: str):
+        self.locations.pop(code, None)
+        await self.broadcast(code, {"type": "trip_ended"})
+
+    async def update_location(self, code: str, member_id: str, location: dict):
+        payload = {"member_id": member_id, **location}
+        self.locations.setdefault(code, {})[member_id] = payload
+        await self.broadcast(code, {"type": "location_updated", "location": payload})
 
 
 manager = ConnectionManager()
+bearer = HTTPBearer()
+JWT_SECRET = os.getenv("JWT_SECRET", "development-only-change-me")
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 600_000)
+    return f"pbkdf2_sha256$600000${base64.b64encode(salt).decode()}${base64.b64encode(digest).decode()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, iterations, salt_text, digest_text = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = base64.b64decode(salt_text)
+        expected = base64.b64decode(digest_text)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, int(iterations))
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def serialize_user(user: User):
+    return {
+        "id": user.id,
+        "username": user.name,
+        "name": user.name,
+        "phoneNumber": user.phone_number,
+        "email": user.email,
+        "carName": user.car_name,
+        "carNumber": user.car_number,
+    }
+
+
+def create_token(user: User):
+    expires = datetime.now(timezone.utc) + timedelta(days=30)
+    return jwt.encode({"sub": str(user.id), "exp": expires}, JWT_SECRET, algorithm="HS256")
 
 
 def get_db():
@@ -122,6 +216,17 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def current_user(credentials: HTTPAuthorizationCredentials = Depends(bearer), db: Session = Depends(get_db)) -> User:
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        user = db.get(User, int(payload["sub"]))
+    except (jwt.PyJWTError, KeyError, TypeError, ValueError):
+        user = None
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired login")
+    return user
 
 
 def serialize(convoy: Convoy):
@@ -192,14 +297,62 @@ def create_tables():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "gps_protocol": 1}
+
+
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
+def register(body: RegisterInput, db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    if db.scalar(select(User).where(User.email == email)) is not None:
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+    user = User(
+        email=email,
+        password_hash=hash_password(body.password),
+        name=body.name.strip(),
+        phone_number=body.phone_number.strip(),
+        car_name=body.car_name.strip(),
+        car_number=body.car_number.strip().upper(),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {"token": create_token(user), "user": serialize_user(user)}
+
+
+@app.post("/auth/login")
+def login(body: LoginInput, db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.email == body.email.strip().lower()))
+    if user is None or not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    return {"token": create_token(user), "user": serialize_user(user)}
+
+
+@app.get("/profile")
+def get_profile(user: User = Depends(current_user)):
+    return serialize_user(user)
+
+
+@app.patch("/profile")
+def update_profile(body: ProfileUpdateInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    duplicate = db.scalar(select(User).where(User.email == email, User.id != user.id))
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+    user.email = email
+    user.name = body.name.strip()
+    user.phone_number = body.phone_number.strip()
+    user.car_name = body.car_name.strip()
+    user.car_number = body.car_number.strip().upper()
+    db.commit()
+    db.refresh(user)
+    return serialize_user(user)
 
 
 @app.post("/convoys", status_code=status.HTTP_201_CREATED)
 def create_convoy(body: CreateConvoyInput, db: Session = Depends(get_db)):
     code = make_code(db)
-    member_data = body.model_dump(exclude={"name"})
-    convoy = Convoy(code=code, creator_id=body.member_id, name=body.name.strip())
+    member_data = body.model_dump()
+    convoy = Convoy(code=code, creator_id=body.member_id, name=f"{body.name.strip()}'s Convoy")
     convoy.members.append(ConvoyMember(convoy_code=code, **member_data))
     db.add(convoy)
     db.commit()
@@ -210,8 +363,6 @@ def create_convoy(body: CreateConvoyInput, db: Session = Depends(get_db)):
 @app.post("/convoys/{code}/join")
 def join_convoy(code: str, member: MemberInput, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     convoy = get_convoy_or_404(db, code)
-    if convoy.started:
-        raise HTTPException(status_code=409, detail="This convoy has already started")
     existing = db.get(ConvoyMember, (convoy.code, member.member_id))
     if existing is None:
         db.add(ConvoyMember(convoy_code=convoy.code, **member.model_dump()))
@@ -237,6 +388,7 @@ def start_convoy(code: str, body: StartInput, background_tasks: BackgroundTasks,
     db.refresh(convoy)
     room_data = serialize(convoy)
     background_tasks.add_task(manager.broadcast_room_updated, convoy.code, room_data)
+    background_tasks.add_task(manager.broadcast_trip_started, convoy.code)
     return room_data
 
 
@@ -257,7 +409,7 @@ def leave_convoy(code: str, body: MemberActionInput, background_tasks: Backgroun
         if remaining:
             db.delete(remaining)
             db.commit()
-        background_tasks.add_task(manager.broadcast_member_left, convoy_code, body.member_id)
+        background_tasks.add_task(manager.broadcast_trip_ended, convoy_code)
         return {"deleted": True}
 
     convoy = get_convoy_or_404(db, convoy_code)
@@ -265,6 +417,19 @@ def leave_convoy(code: str, body: MemberActionInput, background_tasks: Backgroun
     background_tasks.add_task(manager.broadcast_member_left, convoy_code, body.member_id)
     background_tasks.add_task(manager.broadcast_room_updated, convoy_code, room_data)
     return room_data
+
+
+@app.post("/convoys/{code}/end")
+def end_convoy(code: str, body: MemberActionInput, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    convoy = get_convoy_or_404(db, code)
+    if convoy.creator_id != body.member_id:
+        raise HTTPException(status_code=403, detail="Only the convoy leader can end the trip")
+
+    convoy_code = convoy.code
+    db.delete(convoy)
+    db.commit()
+    background_tasks.add_task(manager.broadcast_trip_ended, convoy_code)
+    return {"ended": True}
 
 
 @app.delete("/convoys/{code}/members/{target_member_id}")
@@ -331,6 +496,26 @@ async def convoy_websocket(websocket: WebSocket, code: str, member_id: str = Que
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
+                continue
+            try:
+                message = json.loads(data)
+                if message.get("type") != "location_update":
+                    continue
+                latitude = float(message["latitude"])
+                longitude = float(message["longitude"])
+                if not math.isfinite(latitude) or not math.isfinite(longitude) or not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                    continue
+                speed = message.get("speed")
+                heading = message.get("heading")
+                await manager.update_location(code, member_id, {
+                    "lat": latitude,
+                    "long": longitude,
+                    "spe": float(speed) if speed is not None and math.isfinite(float(speed)) else None,
+                    "h": float(heading) if heading is not None and math.isfinite(float(heading)) else None,
+                    "time": datetime.now(timezone.utc).isoformat(),
+                })
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
     except WebSocketDisconnect:
         manager.disconnect(code, member_id)
         await manager.broadcast_presence(code)
