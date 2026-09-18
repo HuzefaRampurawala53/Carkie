@@ -1,7 +1,7 @@
 workflows:
   android-build:
     name: Android Build
-    instance_type: linux_default
+    instance_type: linux
     max_build_duration: 120
     environment:
       node: 22
