@@ -2,6 +2,7 @@
   "dependencies": {
     "@react-navigation/native": "^7.3.14",
     "axios": "^1.19.0",
+    "react-native-maps": "^1.29.0",
     "zustand": "^5.0.14"
   }
 }

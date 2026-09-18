@@ -162,6 +162,12 @@ class ConnectionManager:
     async def broadcast_trip_ended(self, code: str):
         self.locations.pop(code, None)
         await self.broadcast(code, {"type": "trip_ended"})
+        sockets = list(self.rooms.pop(code, {}).values())
+        for websocket in sockets:
+            try:
+                await websocket.close(code=4000, reason="trip_ended")
+            except Exception:
+                pass
 
     async def update_location(self, code: str, member_id: str, location: dict):
         payload = {"member_id": member_id, **location}
@@ -399,20 +405,29 @@ def leave_convoy(code: str, body: MemberActionInput, background_tasks: Backgroun
     if member is None:
         raise HTTPException(status_code=404, detail="Member not found in this convoy")
 
-    is_creator = convoy.creator_id == body.member_id
     convoy_code = convoy.code
+    is_creator = convoy.creator_id == body.member_id
     db.delete(member)
     db.commit()
 
     if is_creator:
-        remaining = db.scalar(select(Convoy).where(Convoy.code == convoy_code))
+        remaining = db.scalar(
+            select(ConvoyMember)
+            .where(ConvoyMember.convoy_code == convoy_code)
+            .order_by(ConvoyMember.joined_at)
+            .limit(1)
+        )
         if remaining:
-            db.delete(remaining)
+            convoy.creator_id = remaining.member_id
             db.commit()
-        background_tasks.add_task(manager.broadcast_trip_ended, convoy_code)
-        return {"deleted": True}
+        else:
+            db.delete(convoy)
+            db.commit()
+            background_tasks.add_task(manager.broadcast_trip_ended, convoy_code)
+            return {"deleted": True}
 
     convoy = get_convoy_or_404(db, convoy_code)
+    db.refresh(convoy)
     room_data = serialize(convoy)
     background_tasks.add_task(manager.broadcast_member_left, convoy_code, body.member_id)
     background_tasks.add_task(manager.broadcast_room_updated, convoy_code, room_data)
@@ -420,7 +435,7 @@ def leave_convoy(code: str, body: MemberActionInput, background_tasks: Backgroun
 
 
 @app.post("/convoys/{code}/end")
-def end_convoy(code: str, body: MemberActionInput, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+async def end_convoy(code: str, body: MemberActionInput, db: Session = Depends(get_db)):
     convoy = get_convoy_or_404(db, code)
     if convoy.creator_id != body.member_id:
         raise HTTPException(status_code=403, detail="Only the convoy leader can end the trip")
@@ -428,7 +443,7 @@ def end_convoy(code: str, body: MemberActionInput, background_tasks: BackgroundT
     convoy_code = convoy.code
     db.delete(convoy)
     db.commit()
-    background_tasks.add_task(manager.broadcast_trip_ended, convoy_code)
+    await manager.broadcast_trip_ended(convoy_code)
     return {"ended": True}
 
 
@@ -508,11 +523,11 @@ async def convoy_websocket(websocket: WebSocket, code: str, member_id: str = Que
                 speed = message.get("speed")
                 heading = message.get("heading")
                 await manager.update_location(code, member_id, {
-                    "lat": latitude,
-                    "long": longitude,
-                    "spe": float(speed) if speed is not None and math.isfinite(float(speed)) else None,
-                    "h": float(heading) if heading is not None and math.isfinite(float(heading)) else None,
-                    "time": datetime.now(timezone.utc).isoformat(),
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "speed": float(speed) if speed is not None and math.isfinite(float(speed)) else None,
+                    "heading": float(heading) if heading is not None and math.isfinite(float(heading)) else None,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
